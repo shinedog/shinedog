@@ -1,12 +1,3 @@
-# Conventional commit:
-# feat(repo-health): add auto-close & comment; fix jq owner path; harden inputs
-#
-# - Idempotent issue upsert with fingerprint + hash
-# - Auto-comment and close when repos become clean
-# - Fix jq path for __owner in auto-close step
-# - Safer defaults when triggered by cron (no inputs)
-# - Small robustness improvements
-
 name: Repo Health (Default vs Latest + Alerts w/ Auto-Close)
 
 on:
@@ -49,14 +40,13 @@ on:
 
 permissions:
   contents: read
-  issues: write   # needed if you use GITHUB_TOKEN to open issues (PAT ignores this)
+  issues: write
 
 jobs:
   repo-health:
     runs-on: ubuntu-latest
-
     env:
-      # Use raw inputs; fall back to defaults in the Prep step so cron runs are safe
+      # Raw inputs (may be empty on cron); we set safe defaults in "Prep".
       OWNERS_CSV: ${{ inputs.owners }}
       INC_ARCHIVED: ${{ inputs.include_archived }}
       INC_FORKS: ${{ inputs.include_forks }}
@@ -65,20 +55,14 @@ jobs:
       CREATE_ISSUES: ${{ inputs.create_issues }}
       FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
       REOPEN_CLOSED: ${{ inputs.reopen_closed }}
-      # Prefer PAT for cross-repo private visibility; falls back to GITHUB_TOKEN
+      # Prefer PAT for private cross-owner visibility; falls back to GITHUB_TOKEN.
       GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
 
     steps:
-      - name: Show tooling versions (gh, jq)
-        run: |
-          gh --version || true
-          jq --version
-
-      - name: Prep
+      - name: Prep (defaults & timestamp)
         run: |
           set -euo pipefail
           mkdir -p reports/${{ github.run_id }}
-          # Safe defaults when triggered by cron (inputs can be empty)
           : "${OWNERS_CSV:=shinedog,adriaanse-dev}"
           : "${INC_ARCHIVED:=false}"
           : "${INC_FORKS:=true}"
@@ -87,20 +71,22 @@ jobs:
           : "${CREATE_ISSUES:=true}"
           : "${FAIL_ON_CRITICAL:=true}"
           : "${REOPEN_CLOSED:=true}"
-          echo "OWNERS_CSV=$OWNERS_CSV" >> "$GITHUB_ENV"
-          echo "INC_ARCHIVED=$INC_ARCHIVED" >> "$GITHUB_ENV"
-          echo "INC_FORKS=$INC_FORKS" >> "$GITHUB_ENV"
-          echo "ONLY_PRIVATE=$ONLY_PRIVATE" >> "$GITHUB_ENV"
-          echo "STALE_DAYS=$STALE_DAYS" >> "$GITHUB_ENV"
-          echo "CREATE_ISSUES=$CREATE_ISSUES" >> "$GITHUB_ENV"
-          echo "FAIL_ON_CRITICAL=$FAIL_ON_CRITICAL" >> "$GITHUB_ENV"
-          echo "REOPEN_CLOSED=$REOPEN_CLOSED" >> "$GITHUB_ENV"
-
+          {
+            echo "OWNERS_CSV=$OWNERS_CSV"
+            echo "INC_ARCHIVED=$INC_ARCHIVED"
+            echo "INC_FORKS=$INC_FORKS"
+            echo "ONLY_PRIVATE=$ONLY_PRIVATE"
+            echo "STALE_DAYS=$STALE_DAYS"
+            echo "CREATE_ISSUES=$CREATE_ISSUES"
+            echo "FAIL_ON_CRITICAL=$FAIL_ON_CRITICAL"
+            echo "REOPEN_CLOSED=$REOPEN_CLOSED"
+          } >> "$GITHUB_ENV"
           printf "%s\n" "$OWNERS_CSV" | tr ',' '\n' | awk '{$1=$1};1' > owners.txt
           date -u +"%Y-%m-%dT%H:%M:%SZ" > reports/${{ github.run_id }}/timestamp.txt
 
       - name: GraphQL sweep: repositories
-        env: { GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }} }
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
         run: |
           set -euo pipefail
           q_repos='
@@ -160,7 +146,8 @@ jobs:
           ' repos_all.json > repos_filtered.json
 
       - name: GraphQL sweep: latest commit across all branches per repo
-        env: { GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }} }
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
         run: |
           set -euo pipefail
           q_refs='
@@ -317,7 +304,6 @@ EOF
             hash=$(sha_payload "$owner" "$repo" "$def_branch" "$last_def" "$diverges" "$stale" "$STALE_DAYS")
             body="$(make_body "$owner" "$repo" "$def_branch" "$last_def" "$STALE_DAYS" "$diverges" "$stale" "$hash")"
 
-            # find existing (state=all) by fingerprint; fallback to exact title
             existing_json=$(gh api "/repos/$owner/$repo/issues" -f per_page=100 -f state=all \
               -q '[.[] | select(.body != null and (.body | contains("repo-health-fp: '"$owner/$repo"'")))]')
             if [ "$(jq 'length' <<<"$existing_json")" -eq 0 ]; then
@@ -355,9 +341,8 @@ EOF
         run: |
           set -euo pipefail
           jq -r '.ids[]?' violations.json > violating_ids.txt || true
-
-          # ✅ FIX: Correct jq path (no space) for __owner
-          jq -r '.[] | "\(..__owner)/\(.name)"' repos_filtered.json > all_ids.txt
+          # ✅ fixed jq path: build "owner/repo" from scanned set
+          jq -r '.[] | .__owner + "/" + .name' repos_filtered.json > all_ids.txt
 
           while read -r id; do
             [ -z "$id" ] && continue
