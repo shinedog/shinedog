@@ -1,5 +1,5 @@
 # .github/workflows/repo-health.yml
-name: Repo Health (Last Commit Dates)
+name: Repo Health (Default vs Latest Commit)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,14 @@ on:
         description: "Comma-separated list of owners (users/orgs)"
         required: true
         default: "shinedog,adriaanse-dev"
+      include_archived:
+        description: "Include archived repos (true/false)"
+        required: false
+        default: "false"
+      include_forks:
+        description: "Include forks (true/false)"
+        required: false
+        default: "true"
   schedule:
     - cron: "17 3 * * *"  # daily at 03:17 America/New_York
 
@@ -15,12 +23,14 @@ permissions:
   contents: read
 
 jobs:
-  last-commit-dates:
+  last-commit-default-vs-any:
     runs-on: ubuntu-latest
     env:
       OWNERS_CSV: ${{ inputs.owners || 'shinedog,adriaanse-dev' }}
+      INC_ARCHIVED: ${{ inputs.include_archived || 'false' }}
+      INC_FORKS: ${{ inputs.include_forks || 'true' }}
       # REQUIRED for private repos across accounts/orgs:
-      # Add repo secret GH_TOKEN_RO (Fine-grained: Read-only on all desired repos; Classic: scopes repo, read:org)
+      # Add repo secret GH_TOKEN_RO (Fine-grained: read-only on all desired repos; or Classic: scopes repo, read:org)
       GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
     steps:
       - name: Prepare workspace
@@ -28,14 +38,14 @@ jobs:
           set -euo pipefail
           mkdir -p reports/${{ github.run_id }}
           echo "$OWNERS_CSV" | tr ',' '\n' | awk '{$1=$1};1' > owners.txt
-          echo "Owners:" && cat owners.txt
+          echo "Owners to scan:" && cat owners.txt
 
-      - name: Fetch repositories via GraphQL for each owner (PRIVATE supported)
+      - name: Fetch repositories via GraphQL (paginated)
         env:
           GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
         run: |
           set -euo pipefail
-          q='
+          q_repos='
           query($owner:String!, $after:String) {
             repositoryOwner(login:$owner) {
               repositories(
@@ -68,12 +78,11 @@ jobs:
             cursor=""
             while :; do
               if [ -z "$cursor" ]; then
-                resp=$(gh api graphql -f owner="$owner" -f query="$q")
+                resp=$(gh api graphql -f owner="$owner" -f query="$q_repos")
               else
-                resp=$(gh api graphql -f owner="$owner" -f query="$q" -f after="$cursor")
+                resp=$(gh api graphql -f owner="$owner" -f query="$q_repos" -f after="$cursor")
               fi
 
-              # Validate access
               if [ "$(jq -r '.data.repositoryOwner' <<<"$resp")" = "null" ]; then
                 echo "WARN: No access to '$owner' with current token; skipping." >&2
                 break
@@ -92,36 +101,103 @@ jobs:
             done
           done < owners.txt
 
-          out="reports/${{ github.run_id }}/last_commit_dates.csv"
-          echo 'owner,repo,default_branch,last_commit_date,source,private,fork,archived,empty,pushed_at' > "$out"
+          # Optional filtering (archived/forks)
+          jq --arg incA "${INC_ARCHIVED}" --arg incF "${INC_FORKS}" '
+            map(select( ($incA=="true" or (.isArchived|not))
+                      and ($incF=="true" or (.isFork|not)) ))
+          ' repos_all.json > repos_filtered.json
 
-          jq -r '
-            .[] |
-            {
-              owner: .__owner,
-              repo: .name,
-              default_branch: (.defaultBranchRef.name // ""),
-              commit_date: (.defaultBranchRef.target.committedDate // ""),
-              pushed_at: (.pushedAt // ""),
-              private: .isPrivate,
-              fork: .isFork,
-              archived: .isArchived,
-              empty: .isEmpty
+      - name: For each repo, collect ALL branch heads and compute latest-any date
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+        run: |
+          set -euo pipefail
+
+          q_refs='
+          query($owner:String!, $name:String!, $after:String) {
+            repository(owner:$owner, name:$name) {
+              refs(first: 100, refPrefix: "refs/heads/", after: $after, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  name
+                  target { ... on Commit { committedDate } }
+                }
+              }
             }
-            | .source = (if (.commit_date|length)>0 then "defaultBranchRef" else "pushedAt" end)
-            | .last = (if (.commit_date|length)>0 then .commit_date else .pushed_at end)
-            | [ .owner, .repo, .default_branch, .last, .source, (.private|tostring), (.fork|tostring), (.archived|tostring), (.empty|tostring), .pushed_at ]
-            | @csv
-          ' repos_all.json >> "$out"
+          }'
 
+          # Output CSV
+          out="reports/${{ github.run_id }}/repo_commits.csv"
+          echo 'owner,repo,default_branch,last_default,latest_any,diverges,private,archived,empty,pushed_at' > "$out"
+
+          jq -c '.[]' repos_filtered.json | while read -r repo; do
+            owner=$(jq -r '.__owner' <<<"$repo")
+            name=$(jq -r '.name' <<<"$repo")
+            def_branch=$(jq -r '.defaultBranchRef.name // ""' <<<"$repo")
+            last_default=$(jq -r '.defaultBranchRef.target.committedDate // ""' <<<"$repo")
+            private=$(jq -r '.isPrivate' <<<"$repo")
+            archived=$(jq -r '.isArchived' <<<"$repo")
+            empty=$(jq -r '.isEmpty' <<<"$repo")
+            pushed_at=$(jq -r '.pushedAt // ""' <<<"$repo")
+
+            # Gather ALL branch commit dates via paginated GraphQL
+            tmp="branch_commits.json"
+            echo '[]' > "$tmp"
+            cursor=""
+            while :; do
+              if [ -z "$cursor" ]; then
+                r=$(gh api graphql -f owner="$owner" -f name="$name" -f query="$q_refs" 2>/dev/null || true)
+              else
+                r=$(gh api graphql -f owner="$owner" -f name="$name" -f query="$q_refs" -f after="$cursor" 2>/dev/null || true)
+              fi
+
+              # If repo not accessible (rare), break gracefully
+              if [ -z "$r" ] || [ "$(jq -r '.data.repository' <<<"$r" 2>/dev/null)" = "null" ]; then
+                break
+              fi
+
+              nodes=$(jq '.data.repository.refs.nodes | map(.target.committedDate) | map(select(. != null))' <<<"$r")
+              jq -s '.[0] + .[1]' "$tmp" <(echo "$nodes") > t.json && mv t.json "$tmp"
+
+              hasNext=$(jq -r '.data.repository.refs.pageInfo.hasNextPage' <<<"$r")
+              [ "$hasNext" != "true" ] && break
+              cursor=$(jq -r '.data.repository.refs.pageInfo.endCursor' <<<"$r")
+            done
+
+            # Compute latest_any (max ISO timestamp); if none, fall back to pushed_at
+            latest_any=$(jq -r 'if length>0 then sort | .[-1] else "" end' "$tmp")
+            if [ -z "$latest_any" ] && [ -n "$pushed_at" ]; then
+              latest_any="$pushed_at"
+            fi
+
+            # Divergence if latest_any > last_default (lex compare OK for ISO 8601 Z)
+            diverges="false"
+            if [ -n "$latest_any" ] && [ -n "$last_default" ] && [ "$latest_any" \> "$last_default" ]; then
+              diverges="true"
+            fi
+            if [ -z "$last_default" ] && [ -n "$latest_any" ]; then
+              diverges="true"
+            fi
+
+            printf '"%s","%s","%s","%s","%s","%s",%s,%s,%s,"%s"\n' \
+              "$owner" "$name" "$def_branch" "$last_default" "$latest_any" "$diverges" "$private" "$archived" "$empty" "$pushed_at" \
+              >> "$out"
+          done
+
+      - name: Build Markdown summary (default-only + divergence flag)
+        run: |
+          set -euo pipefail
+          out="reports/${{ github.run_id }}/repo_commits.csv"
           {
-            echo "### Last Commit Dates"
+            echo "### Default Branch Recency & Divergence"
             echo
-            echo "| Owner | Repo | Default Branch | Last Commit (ISO) | Source | Private | Archived |"
-            echo "|-------|------|----------------|-------------------|--------|---------|----------|"
+            echo "| Owner | Repo | Default Branch | Last Commit (Default) | Diverges (any branch newer) | Private | Archived |"
+            echo "|-------|------|----------------|-----------------------|------------------------------|---------|----------|"
             awk -F',' 'NR>1 {
-              for (i=1;i<=7;i++) { gsub(/^"|"$/, "", $i) }
-              printf("| %s | %s | %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5,$6,$8)
+              # strip quotes
+              for (i=1;i<=NF;i++) gsub(/^"|"$/, "", $i)
+              # columns: 1 owner, 2 repo, 3 default_branch, 4 last_default, 5 latest_any, 6 diverges, 7 private, 8 archived
+              printf("| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$6,$7,$8)
             }' "$out"
           } > "reports/${{ github.run_id }}/summary.md"
 
