@@ -9,7 +9,7 @@ on:
         required: true
         default: "shinedog"
   schedule:
-    - cron: "17 3 * * *"  # daily
+    - cron: "17 3 * * *"
 
 permissions:
   contents: read
@@ -19,7 +19,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       OWNER: ${{ inputs.owner || 'shinedog' }}
-      # Prefer a PAT with repo/read:org for private repos. Falls back to GITHUB_TOKEN (public).
       GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
     steps:
       - name: Prepare workspace
@@ -27,7 +26,7 @@ jobs:
           set -euo pipefail
           mkdir -p reports/${{ github.run_id }}
 
-      - name: Fetch repositories via GraphQL (paginated)
+      - name: Fetch repositories via GraphQL (paginated; fixed cursor handling)
         env:
           GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
         run: |
@@ -36,9 +35,7 @@ jobs:
 
           q='
           query($owner:String!, $after:String) {
-            rateLimit { remaining resetAt }
             repositoryOwner(login:$owner) {
-              __typename
               repositories(first: 100, after: $after, ownerAffiliations: OWNER, orderBy: {field: NAME, direction: ASC}) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
@@ -50,32 +47,42 @@ jobs:
                   pushedAt
                   defaultBranchRef {
                     name
-                    target {
-                      ... on Commit { committedDate }
-                    }
+                    target { ... on Commit { committedDate } }
                   }
                 }
               }
             }
           }'
 
-          # paginate
-          cursor="null"
           echo '[]' > repos_all.json
+          cursor=""
           while :; do
-            resp=$(gh api graphql -f owner="$owner" -f after="$cursor" -f query="$q")
-            # append nodes
+            if [ -z "$cursor" ]; then
+              resp=$(gh api graphql -f owner="$owner" -f query="$q")
+            else
+              resp=$(gh api graphql -f owner="$owner" -f query="$q" -f after="$cursor")
+            fi
+
+            # Bail early if owner not found or no access
+            if [ "$(jq -r '.data.repositoryOwner | type' <<<"$resp")" = "null" ] || \
+               [ "$(jq -r '.data.repositoryOwner' <<<"$resp")" = "null" ]; then
+              echo "Error: repositoryOwner '$owner' not found or not accessible with provided token." >&2
+              exit 1
+            fi
+
             nodes=$(jq '.data.repositoryOwner.repositories.nodes' <<<"$resp")
             jq -s '.[0] + .[1]' repos_all.json <(echo "$nodes") > tmp.json && mv tmp.json repos_all.json
-            # next page?
+
             hasNext=$(jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' <<<"$resp")
-            if [ "$hasNext" != "true" ]; then break; fi
-            cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor | @json' <<<"$resp")
+            if [ "$hasNext" != "true" ]; then
+              break
+            fi
+            cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor' <<<"$resp")
           done
 
-          # Write CSV
           out="reports/${{ github.run_id }}/last_commit_dates.csv"
           echo 'repo,default_branch,last_commit_date,source,private,fork,archived,empty,pushed_at' > "$out"
+
           jq -r '
             .[] | {
               repo: .name,
@@ -86,14 +93,13 @@ jobs:
               fork: .isFork,
               archived: .isArchived,
               empty: .isEmpty
-            } |
-            .source = (if (.commit_date|length)>0 then "defaultBranchRef" else "pushedAt" end) |
-            .last = (if (.commit_date|length)>0 then .commit_date else .pushed_at end) |
-            [ .repo, .default_branch, .last, .source, (.private|tostring), (.fork|tostring), (.archived|tostring), (.empty|tostring), .pushed_at ]
+            }
+            | .source = (if (.commit_date|length)>0 then "defaultBranchRef" else "pushedAt" end)
+            | .last = (if (.commit_date|length)>0 then .commit_date else .pushed_at end)
+            | [ .repo, .default_branch, .last, .source, (.private|tostring), (.fork|tostring), (.archived|tostring), (.empty|tostring), .pushed_at ]
             | @csv
           ' repos_all.json >> "$out"
 
-          # Markdown summary (no error JSON possible here)
           {
             echo "### Last Commit Dates for \`$owner\`"
             echo
