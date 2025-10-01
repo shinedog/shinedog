@@ -1,11 +1,11 @@
 # .github/workflows/repo-health.yml
-name: Repo Health (Default vs Latest Commit)
+name: Repo Health (Default vs Latest + Alerts w/ Auto-Close)
 
 on:
   workflow_dispatch:
     inputs:
       owners:
-        description: "Comma-separated list of owners (users/orgs)"
+        description: "Comma-separated owners (users/orgs)"
         required: true
         default: "shinedog,adriaanse-dev"
       include_archived:
@@ -16,33 +16,57 @@ on:
         description: "Include forks (true/false)"
         required: false
         default: "true"
+      only_private:
+        description: "Limit to private repos (true/false)"
+        required: false
+        default: "false"
+      stale_days:
+        description: "Stale threshold in days (default 180)"
+        required: false
+        default: "180"
+      create_issues:
+        description: "Create/update issues on violations (true/false)"
+        required: false
+        default: "true"
+      fail_on_critical:
+        description: "Fail the workflow if violations exist (true/false)"
+        required: false
+        default: "true"
+      reopen_closed:
+        description: "Reopen a closed matching issue (true/false)"
+        required: false
+        default: "true"
   schedule:
     - cron: "17 3 * * *"  # daily at 03:17 America/New_York
 
 permissions:
   contents: read
+  issues: write   # needed for create/update/close comments
 
 jobs:
-  last-commit-default-vs-any:
+  repo-health:
     runs-on: ubuntu-latest
     env:
       OWNERS_CSV: ${{ inputs.owners || 'shinedog,adriaanse-dev' }}
       INC_ARCHIVED: ${{ inputs.include_archived || 'false' }}
       INC_FORKS: ${{ inputs.include_forks || 'true' }}
-      # REQUIRED for private repos across accounts/orgs:
-      # Add repo secret GH_TOKEN_RO (Fine-grained: read-only on all desired repos; or Classic: scopes repo, read:org)
+      ONLY_PRIVATE: ${{ inputs.only_private || 'false' }}
+      STALE_DAYS: ${{ inputs.stale_days || '180' }}
+      CREATE_ISSUES: ${{ inputs.create_issues || 'true' }}
+      FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical || 'true' }}
+      REOPEN_CLOSED: ${{ inputs.reopen_closed || 'true' }}
+      # PAT strongly recommended for private cross-owner scans (Fine-grained: read-only; or Classic: repo, read:org)
       GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
     steps:
-      - name: Prepare workspace
+      - name: Prep
         run: |
           set -euo pipefail
           mkdir -p reports/${{ github.run_id }}
           echo "$OWNERS_CSV" | tr ',' '\n' | awk '{$1=$1};1' > owners.txt
-          echo "Owners to scan:" && cat owners.txt
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > reports/${{ github.run_id }}/timestamp.txt
 
-      - name: Fetch repositories via GraphQL (paginated)
-        env:
-          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+      - name: GraphQL sweep: repositories
+        env: { GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }} }
         run: |
           set -euo pipefail
           q_repos='
@@ -70,9 +94,7 @@ jobs:
               }
             }
           }'
-
           echo '[]' > repos_all.json
-
           while read -r owner; do
             [ -z "$owner" ] && continue
             cursor=""
@@ -82,53 +104,44 @@ jobs:
               else
                 resp=$(gh api graphql -f owner="$owner" -f query="$q_repos" -f after="$cursor")
               fi
-
               if [ "$(jq -r '.data.repositoryOwner' <<<"$resp")" = "null" ]; then
-                echo "WARN: No access to '$owner' with current token; skipping." >&2
+                echo "WARN: No access to '$owner'; skipping." >&2
                 break
               fi
-
               nodes=$(jq --arg owner "$owner" '
                 .data.repositoryOwner.repositories.nodes
                 | map(. + { __owner: $owner })
               ' <<<"$resp")
-
-              jq -s '.[0] + .[1]' repos_all.json <(echo "$nodes") > tmp.json && mv tmp.json repos_all.json
-
-              hasNext=$(jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' <<<"$resp")
-              [ "$hasNext" != "true" ] && break
+              jq -s '.[0] + .[1]' repos_all.json <(echo "$nodes") > t.json && mv t.json repos_all.json
+              jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' <<<"$resp" | grep -q true || break
               cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor' <<<"$resp")
             done
           done < owners.txt
 
-          # Optional filtering (archived/forks)
-          jq --arg incA "${INC_ARCHIVED}" --arg incF "${INC_FORKS}" '
+          # Filter archived/forks/private visibility
+          jq --arg incA "$INC_ARCHIVED" --arg incF "$INC_FORKS" --arg onlyP "$ONLY_PRIVATE" '
             map(select( ($incA=="true" or (.isArchived|not))
-                      and ($incF=="true" or (.isFork|not)) ))
+                      and ($incF=="true" or (.isFork|not))
+                      and ($onlyP!="true" or .isPrivate==true) ))
           ' repos_all.json > repos_filtered.json
 
-      - name: For each repo, collect ALL branch heads and compute latest-any date
-        env:
-          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+      - name: GraphQL sweep: latest commit across all branches per repo
+        env: { GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }} }
         run: |
           set -euo pipefail
-
           q_refs='
           query($owner:String!, $name:String!, $after:String) {
             repository(owner:$owner, name:$name) {
               refs(first: 100, refPrefix: "refs/heads/", after: $after, orderBy: {field: TAG_COMMIT_DATE, direction: DESC}) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
-                  name
                   target { ... on Commit { committedDate } }
                 }
               }
             }
           }'
-
-          # Output CSV
-          out="reports/${{ github.run_id }}/repo_commits.csv"
-          echo 'owner,repo,default_branch,last_default,latest_any,diverges,private,archived,empty,pushed_at' > "$out"
+          OUT="reports/${{ github.run_id }}/repo_commits.csv"
+          echo 'owner,repo,default_branch,last_default,latest_any,diverges,private,archived,empty,pushed_at' > "$OUT"
 
           jq -c '.[]' repos_filtered.json | while read -r repo; do
             owner=$(jq -r '.__owner' <<<"$repo")
@@ -140,9 +153,7 @@ jobs:
             empty=$(jq -r '.isEmpty' <<<"$repo")
             pushed_at=$(jq -r '.pushedAt // ""' <<<"$repo")
 
-            # Gather ALL branch commit dates via paginated GraphQL
-            tmp="branch_commits.json"
-            echo '[]' > "$tmp"
+            echo '[]' > dates.json
             cursor=""
             while :; do
               if [ -z "$cursor" ]; then
@@ -150,60 +161,210 @@ jobs:
               else
                 r=$(gh api graphql -f owner="$owner" -f name="$name" -f query="$q_refs" -f after="$cursor" 2>/dev/null || true)
               fi
-
-              # If repo not accessible (rare), break gracefully
-              if [ -z "$r" ] || [ "$(jq -r '.data.repository' <<<"$r" 2>/dev/null)" = "null" ]; then
-                break
-              fi
-
+              [ -z "$r" ] && break
+              if [ "$(jq -r '.data.repository' <<<"$r")" = "null" ]; then break; fi
               nodes=$(jq '.data.repository.refs.nodes | map(.target.committedDate) | map(select(. != null))' <<<"$r")
-              jq -s '.[0] + .[1]' "$tmp" <(echo "$nodes") > t.json && mv t.json "$tmp"
-
-              hasNext=$(jq -r '.data.repository.refs.pageInfo.hasNextPage' <<<"$r")
-              [ "$hasNext" != "true" ] && break
+              jq -s '.[0] + .[1]' dates.json <(echo "$nodes") > t.json && mv t.json dates.json
+              jq -r '.data.repository.refs.pageInfo.hasNextPage' <<<"$r" | grep -q true || break
               cursor=$(jq -r '.data.repository.refs.pageInfo.endCursor' <<<"$r")
             done
 
-            # Compute latest_any (max ISO timestamp); if none, fall back to pushed_at
-            latest_any=$(jq -r 'if length>0 then sort | .[-1] else "" end' "$tmp")
-            if [ -z "$latest_any" ] && [ -n "$pushed_at" ]; then
-              latest_any="$pushed_at"
-            fi
+            latest_any=$(jq -r 'if length>0 then sort | .[-1] else "" end' dates.json)
+            if [ -z "$latest_any" ] && [ -n "$pushed_at" ]; then latest_any="$pushed_at"; fi
 
-            # Divergence if latest_any > last_default (lex compare OK for ISO 8601 Z)
             diverges="false"
-            if [ -n "$latest_any" ] && [ -n "$last_default" ] && [ "$latest_any" \> "$last_default" ]; then
-              diverges="true"
-            fi
-            if [ -z "$last_default" ] && [ -n "$latest_any" ]; then
-              diverges="true"
-            fi
+            if [ -n "$latest_any" ] && [ -n "$last_default" ] && [ "$latest_any" \> "$last_default" ]; then diverges="true"; fi
+            if [ -z "$last_default" ] && [ -n "$latest_any" ]; then diverges="true"; fi
 
             printf '"%s","%s","%s","%s","%s","%s",%s,%s,%s,"%s"\n' \
               "$owner" "$name" "$def_branch" "$last_default" "$latest_any" "$diverges" "$private" "$archived" "$empty" "$pushed_at" \
-              >> "$out"
+              >> "$OUT"
           done
 
-      - name: Build Markdown summary (default-only + divergence flag)
+      - name: Compute stale/violations and build summary
         run: |
           set -euo pipefail
-          out="reports/${{ github.run_id }}/repo_commits.csv"
+          OUT="reports/${{ github.run_id }}/repo_commits.csv"
+          TS=$(cat reports/${{ github.run_id }}/timestamp.txt)
+          STALE_DAYS=${STALE_DAYS}
+
+          # CSV -> JSON
+          jq -R -s '
+            def parse_csv:
+              split("\n") | map(select(length>0)) |
+              (.[0] | split(",")) as $h |
+              (.[1:] | map(split(","))) |
+              map( [range(0; $h|length)] as $i
+                   | reduce $i[] as $j ({}; . + { ($h[$j]): .[$j] }) );
+            parse_csv
+          ' "$OUT" > table.json
+
+          # evaluate rules
+          jq --arg now "$TS" --argjson days $STALE_DAYS '
+            def unq(x): x|gsub("^\"|\"$";"");
+            def iso_to_secs($s): ( ($s|unq) | select(length>0) | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime );
+            def stale($date):
+              if ($date|unq|length)==0 then false
+              else (( (iso_to_secs($now) - iso_to_secs($date)) / 86400.0 ) > $days)
+              end;
+            map(. + {
+              owner: (.owner|unq),
+              repo: (.repo|unq),
+              default_branch: (.default_branch|unq),
+              last_default: (.last_default|unq),
+              diverges: (.diverges|unq),
+              private: (.private|unq),
+              archived: (.archived|unq),
+              stale_default: stale(.last_default)
+            })
+          ' table.json > eval.json
+
+          # violations: diverges==true OR stale_default==true
+          jq '
+            map(select((.diverges=="true") or (.stale_default==true))) as $v |
+            { count: ($v|length), items: $v,
+              ids: ($v | map("\(.owner)/\(.repo)")) }
+          ' eval.json > violations.json
+
+          # Markdown summary (default-only + divergence + stale)
           {
             echo "### Default Branch Recency & Divergence"
             echo
-            echo "| Owner | Repo | Default Branch | Last Commit (Default) | Diverges (any branch newer) | Private | Archived |"
-            echo "|-------|------|----------------|-----------------------|------------------------------|---------|----------|"
-            awk -F',' 'NR>1 {
-              # strip quotes
-              for (i=1;i<=NF;i++) gsub(/^"|"$/, "", $i)
-              # columns: 1 owner, 2 repo, 3 default_branch, 4 last_default, 5 latest_any, 6 diverges, 7 private, 8 archived
-              printf("| %s | %s | %s | %s | %s | %s | %s |\n", $1,$2,$3,$4,$6,$7,$8)
-            }' "$out"
+            echo "| Owner | Repo | Default Branch | Last Commit (Default) | Diverges | Stale(>${STALE_DAYS}d) | Private | Archived |"
+            echo "|-------|------|----------------|-----------------------|----------|-----------------------|---------|----------|"
+            jq -r '
+              .[] | "| \(.owner) | \(.repo) | \(.default_branch) | \(.last_default) | \(.diverges) | \(.stale_default) | \(.private) | \(.archived) |"
+            ' eval.json
           } > "reports/${{ github.run_id }}/summary.md"
 
-      - name: Upload artifact
+          echo "violations=$(jq -r .count violations.json)" >> $GITHUB_OUTPUT
+
+      - name: Create/Update issues on violating repos (idempotent w/ fingerprint & hash)
+        if: ${{ env.CREATE_ISSUES == 'true' }}
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+        run: |
+          set -euo pipefail
+
+          make_body() {
+            local owner="$1" repo="$2" def_branch="$3" last_def="$4" stale_days="$5" diverges="$6" stale="$7" hash="$8"
+            cat <<EOF
+Detected repo-health issues:
+
+- **Diverges from default**: ${diverges}
+- **Default branch stale (> ${stale_days} days)**: ${stale}
+
+**Default branch**: \`${def_branch:-"(none)"}\`  
+**Last default commit**: \`${last_def:-"(none)"}\`
+
+Remediation checklist:
+- [ ] Review recent branches and merge or retarget default as needed
+- [ ] If divergence is expected (e.g., long-lived release), document it or add a topic to ignore
+- [ ] If repo is intentionally frozen, archive it or add \`repo-health:ignore\` topic
+
+<!-- repo-health-fp: ${owner}/${repo} -->
+<!-- repo-health-hash: ${hash} -->
+EOF
+          }
+
+          # stable hash of the logical payload
+          sha_payload() {
+            local owner="$1" repo="$2" def_branch="$3" last_def="$4" diverges="$5" stale="$6" stale_days="$7"
+            printf '%s' "$owner|$repo|$def_branch|$last_def|$diverges|$stale|$stale_days" | sha256sum | awk '{print $1}'
+          }
+
+          title="[Repo Health] Default branch stale/diverges"
+
+          jq -c '.items[]' violations.json | while read -r it; do
+            owner=$(jq -r '.owner' <<<"$it")
+            repo=$(jq -r '.repo' <<<"$it")
+            def_branch=$(jq -r '.default_branch' <<<"$it")
+            last_def=$(jq -r '.last_default' <<<"$it")
+            diverges=$(jq -r '.diverges' <<<"$it")
+            stale=$(jq -r '.stale_default' <<<"$it")
+            hash=$(sha_payload "$owner" "$repo" "$def_branch" "$last_def" "$diverges" "$stale" "$STALE_DAYS")
+            body="$(make_body "$owner" "$repo" "$def_branch" "$last_def" "$STALE_DAYS" "$diverges" "$stale" "$hash")"
+
+            # find existing (state=all) by fingerprint; fallback to exact title
+            existing_json=$(gh api "/repos/$owner/$repo/issues" -f per_page=100 -f state=all \
+              -q '[.[] | select(.body != null and (.body | contains("repo-health-fp: '"$owner/$repo"'")))]')
+            if [ "$(jq 'length' <<<"$existing_json")" -eq 0 ]; then
+              existing_json=$(gh api "/repos/$owner/$repo/issues" -f per_page=100 -f state=all \
+                -q '.[] | select(.title=="'"$title"'") | [.]')
+            fi
+
+            if [ "$(jq 'length' <<<"$existing_json")" -gt 0 ]; then
+              num=$(jq -r '.[0].number' <<<"$existing_json")
+              state=$(jq -r '.[0].state' <<<"$existing_json")
+              existing_body=$(jq -r '.[0].body // ""' <<<"$existing_json")
+              prev_hash=$(grep -oE 'repo-health-hash: [a-f0-9]+' <<<"$existing_body" | awk '{print $3}' || true)
+
+              # reopen if closed and allowed
+              if [ "$state" = "closed" ] && [ "$REOPEN_CLOSED" = "true" ]; then
+                gh api -X PATCH "/repos/$owner/$repo/issues/$num" -f state="open" >/dev/null
+              fi
+
+              # update only if hash changed
+              if [ "$prev_hash" != "$hash" ]; then
+                gh api -X PATCH "/repos/$owner/$repo/issues/$num" \
+                  -f title="$title" -f body="$body" -f labels="repo-health" >/dev/null
+                echo "Updated issue #$num in $owner/$repo"
+              else
+                echo "No changes for $owner/$repo (issue #$num)"
+              fi
+            else
+              gh api -X POST "/repos/$owner/$repo/issues" \
+                -f title="$title" -f body="$body" -f labels="repo-health" >/dev/null
+              echo "Created issue in $owner/$repo"
+            fi
+          done
+
+      - name: Auto-comment & close issues for repos now clean
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+        run: |
+          set -euo pipefail
+          # Build a fast lookup of violating "owner/repo"
+          jq -r '.ids[]?' violations.json > violating_ids.txt || true
+
+          # iterate all repos we scanned (filtered set)
+          jq -r '.[] | "\(. __owner)/\(.name)"' repos_filtered.json > all_ids.txt
+
+          while read -r id; do
+            [ -z "$id" ] && continue
+            if grep -qx "$id" violating_ids.txt 2>/dev/null; then
+              continue  # still violating; do not close
+            fi
+            owner="${id%%/*}"
+            repo="${id##*/}"
+
+            # find open issues matching our fingerprint or exact title
+            open_json=$(gh api "/repos/$owner/$repo/issues" -f per_page=100 -f state=open \
+              -q '[.[] | select((.body != null and (.body | contains("repo-health-fp: '"$owner/$repo"'"))) or .title=="[Repo Health] Default branch stale/diverges")]')
+
+            count=$(jq 'length' <<<"$open_json")
+            [ "$count" -eq 0 ] && continue
+
+            num=$(jq -r '.[0].number' <<<"$open_json")
+            comment="✅ This repository is now **clean** for the monitored checks (no divergence and default branch not stale). Closing this issue automatically."
+            gh api -X POST "/repos/$owner/$repo/issues/$num/comments" -f body="$comment" >/dev/null
+            gh api -X PATCH "/repos/$owner/$repo/issues/$num" -f state="closed" >/dev/null
+            echo "Closed issue #$num in $owner/$repo (now clean)"
+          done < all_ids.txt
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: repo-health-${{ github.run_id }}
           path: reports/${{ github.run_id }}/
           if-no-files-found: error
+
+      - name: Fail on critical (optional)
+        if: ${{ env.FAIL_ON_CRITICAL == 'true' }}
+        run: |
+          set -euo pipefail
+          v=$(jq -r .count violations.json)
+          if [ "$v" -gt 0 ]; then
+            echo "Found $v violating repos."
+            exit 1
+          fi
