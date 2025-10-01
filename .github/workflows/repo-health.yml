@@ -4,12 +4,12 @@ name: Repo Health (Last Commit Dates)
 on:
   workflow_dispatch:
     inputs:
-      owner:
-        description: "GitHub username or org to inspect"
+      owners:
+        description: "Comma-separated list of owners (users/orgs)"
         required: true
-        default: "shinedog"
+        default: "shinedog,adriaanse-dev"
   schedule:
-    - cron: "17 3 * * *"
+    - cron: "17 3 * * *"  # daily at 03:17 America/New_York
 
 permissions:
   contents: read
@@ -18,25 +18,32 @@ jobs:
   last-commit-dates:
     runs-on: ubuntu-latest
     env:
-      OWNER: ${{ inputs.owner || 'shinedog' }}
+      OWNERS_CSV: ${{ inputs.owners || 'shinedog,adriaanse-dev' }}
+      # REQUIRED for private repos across accounts/orgs:
+      # Add repo secret GH_TOKEN_RO (Fine-grained: Read-only on all desired repos; Classic: scopes repo, read:org)
       GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
     steps:
       - name: Prepare workspace
         run: |
           set -euo pipefail
           mkdir -p reports/${{ github.run_id }}
+          echo "$OWNERS_CSV" | tr ',' '\n' | awk '{$1=$1};1' > owners.txt
+          echo "Owners:" && cat owners.txt
 
-      - name: Fetch repositories via GraphQL (paginated; fixed cursor handling)
+      - name: Fetch repositories via GraphQL for each owner (PRIVATE supported)
         env:
           GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
         run: |
           set -euo pipefail
-          owner="${OWNER}"
-
           q='
           query($owner:String!, $after:String) {
             repositoryOwner(login:$owner) {
-              repositories(first: 100, after: $after, ownerAffiliations: OWNER, orderBy: {field: NAME, direction: ASC}) {
+              repositories(
+                first: 100,
+                after: $after,
+                ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR],
+                orderBy: {field: NAME, direction: ASC}
+              ) {
                 pageInfo { hasNextPage endCursor }
                 nodes {
                   name
@@ -55,36 +62,43 @@ jobs:
           }'
 
           echo '[]' > repos_all.json
-          cursor=""
-          while :; do
-            if [ -z "$cursor" ]; then
-              resp=$(gh api graphql -f owner="$owner" -f query="$q")
-            else
-              resp=$(gh api graphql -f owner="$owner" -f query="$q" -f after="$cursor")
-            fi
 
-            # Bail early if owner not found or no access
-            if [ "$(jq -r '.data.repositoryOwner | type' <<<"$resp")" = "null" ] || \
-               [ "$(jq -r '.data.repositoryOwner' <<<"$resp")" = "null" ]; then
-              echo "Error: repositoryOwner '$owner' not found or not accessible with provided token." >&2
-              exit 1
-            fi
+          while read -r owner; do
+            [ -z "$owner" ] && continue
+            cursor=""
+            while :; do
+              if [ -z "$cursor" ]; then
+                resp=$(gh api graphql -f owner="$owner" -f query="$q")
+              else
+                resp=$(gh api graphql -f owner="$owner" -f query="$q" -f after="$cursor")
+              fi
 
-            nodes=$(jq '.data.repositoryOwner.repositories.nodes' <<<"$resp")
-            jq -s '.[0] + .[1]' repos_all.json <(echo "$nodes") > tmp.json && mv tmp.json repos_all.json
+              # Validate access
+              if [ "$(jq -r '.data.repositoryOwner' <<<"$resp")" = "null" ]; then
+                echo "WARN: No access to '$owner' with current token; skipping." >&2
+                break
+              fi
 
-            hasNext=$(jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' <<<"$resp")
-            if [ "$hasNext" != "true" ]; then
-              break
-            fi
-            cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor' <<<"$resp")
-          done
+              nodes=$(jq --arg owner "$owner" '
+                .data.repositoryOwner.repositories.nodes
+                | map(. + { __owner: $owner })
+              ' <<<"$resp")
+
+              jq -s '.[0] + .[1]' repos_all.json <(echo "$nodes") > tmp.json && mv tmp.json repos_all.json
+
+              hasNext=$(jq -r '.data.repositoryOwner.repositories.pageInfo.hasNextPage' <<<"$resp")
+              [ "$hasNext" != "true" ] && break
+              cursor=$(jq -r '.data.repositoryOwner.repositories.pageInfo.endCursor' <<<"$resp")
+            done
+          done < owners.txt
 
           out="reports/${{ github.run_id }}/last_commit_dates.csv"
-          echo 'repo,default_branch,last_commit_date,source,private,fork,archived,empty,pushed_at' > "$out"
+          echo 'owner,repo,default_branch,last_commit_date,source,private,fork,archived,empty,pushed_at' > "$out"
 
           jq -r '
-            .[] | {
+            .[] |
+            {
+              owner: .__owner,
               repo: .name,
               default_branch: (.defaultBranchRef.name // ""),
               commit_date: (.defaultBranchRef.target.committedDate // ""),
@@ -96,18 +110,18 @@ jobs:
             }
             | .source = (if (.commit_date|length)>0 then "defaultBranchRef" else "pushedAt" end)
             | .last = (if (.commit_date|length)>0 then .commit_date else .pushed_at end)
-            | [ .repo, .default_branch, .last, .source, (.private|tostring), (.fork|tostring), (.archived|tostring), (.empty|tostring), .pushed_at ]
+            | [ .owner, .repo, .default_branch, .last, .source, (.private|tostring), (.fork|tostring), (.archived|tostring), (.empty|tostring), .pushed_at ]
             | @csv
           ' repos_all.json >> "$out"
 
           {
-            echo "### Last Commit Dates for \`$owner\`"
+            echo "### Last Commit Dates"
             echo
-            echo "| Repo | Default Branch | Last Commit (ISO) | Source | Private | Archived |"
-            echo "|------|----------------|-------------------|--------|---------|----------|"
+            echo "| Owner | Repo | Default Branch | Last Commit (ISO) | Source | Private | Archived |"
+            echo "|-------|------|----------------|-------------------|--------|---------|----------|"
             awk -F',' 'NR>1 {
-              gsub(/^"|"$/, "", $1); gsub(/^"|"$/, "", $2); gsub(/^"|"$/, "", $3); gsub(/^"|"$/, "", $4);
-              printf("| %s | %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5,$7)
+              for (i=1;i<=7;i++) { gsub(/^"|"$/, "", $i) }
+              printf("| %s | %s | %s | %s | %s | %s | %s |\n",$1,$2,$3,$4,$5,$6,$8)
             }' "$out"
           } > "reports/${{ github.run_id }}/summary.md"
 
