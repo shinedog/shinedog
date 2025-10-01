@@ -1,0 +1,122 @@
+# .github/workflows/repo-health.yml
+name: Repo Health (Last Commit Dates)
+
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "GitHub username to inspect"
+        required: true
+        default: "shinedog"
+  schedule:
+    - cron: "17 3 * * *" # daily at 03:17 America/New_York
+
+permissions:
+  contents: read
+
+jobs:
+  last-commit-dates:
+    runs-on: ubuntu-latest
+    env:
+      OWNER: ${{ inputs.owner || 'shinedog' }}
+      # Prefer a user PAT with read:org,repo for private repos across the account.
+      # If absent, we fall back to GITHUB_TOKEN (public repos only).
+      GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
+    steps:
+      - name: Prepare workspace
+        run: |
+          mkdir -p reports/${{ github.run_id }}
+          echo "run_id=${{ github.run_id }}" >> $GITHUB_ENV
+
+      - name: Show token mode
+        run: |
+          if [ -n "${{ secrets.GH_TOKEN_RO }}" ]; then
+            echo "Using GH_TOKEN_RO (PAT) for cross-repo access."
+          else
+            echo "Using GITHUB_TOKEN (public repos only)."
+          fi
+
+      - name: List repositories (public if using GITHUB_TOKEN; public+private if PAT)
+        id: list_repos
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+        run: |
+          set -euo pipefail
+          owner="${OWNER}"
+
+          # Decide endpoint based on token type. PAT allows /user/repos; GITHUB_TOKEN often does not.
+          # We try /user first; if it fails, fall back to /users/:owner.
+          get_user_repos() {
+            gh api -H "Accept: application/vnd.github+json" \
+              --paginate /user/repos \
+              -q '.[] | select(.owner.login=="'"$owner"'") | {name, default_branch, private}'
+          }
+
+          get_public_repos() {
+            gh api -H "Accept: application/vnd.github+json" \
+              --paginate /users/"$owner"/repos?type=owner\&per_page=100 \
+              -q '.[] | {name, default_branch, private}'
+          }
+
+          if repos_json=$(get_user_repos 2>/dev/null); then
+            echo "$repos_json" | jq -s '.' > repos.json
+          else
+            echo "Falling back to public repos for $owner"
+            repos_json=$(get_public_repos)
+            echo "$repos_json" | jq -s '.' > repos.json
+          fi
+
+          echo "repo_count=$(jq 'length' repos.json)" >> $GITHUB_OUTPUT
+          jq -r '[ "repo","default_branch","private" ], (.[] | [ .name, .default_branch, (.private//false) ]) | @csv' repos.json \
+            > "reports/${{ github.run_id }}/repos_baseline.csv"
+
+      - name: Fetch last commit date for each repo
+        id: fetch_last_commits
+        env:
+          GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
+        run: |
+          set -euo pipefail
+          owner="${OWNER}"
+
+          # CSV header
+          echo 'repo,default_branch,last_commit_date,private' > "reports/${{ github.run_id }}/last_commit_dates.csv"
+
+          jq -c '.[]' repos.json | while read -r repo; do
+            name=$(jq -r '.name' <<<"$repo")
+            branch=$(jq -r '.default_branch' <<<"$repo")
+            private=$(jq -r '.private // false' <<<"$repo")
+
+            # If default_branch is null, skip safely
+            if [ -z "$branch" ] || [ "$branch" = "null" ]; then
+              echo "${name},,," >> "reports/${{ github.run_id }}/last_commit_dates.csv"
+              continue
+            fi
+
+            # Grab most recent commit on default branch
+            commit_date=$(
+              gh api -H "Accept: application/vnd.github+json" \
+                /repos/"$owner"/"$name"/commits \
+                -f sha="$branch" -f per_page=1 \
+                -q '.[0].commit.author.date' 2>/dev/null || true
+            )
+
+            echo "${name},${branch},${commit_date},${private}" >> "reports/${{ github.run_id }}/last_commit_dates.csv"
+          done
+
+          # Also provide a Markdown summary for quick viewing in the run log
+          {
+            echo "### Last Commit Dates for \`$owner\`"
+            echo ""
+            echo "| Repo | Default Branch | Last Commit (ISO) | Private |"
+            echo "|------|----------------|-------------------|---------|"
+            awk -F',' 'NR>1 { printf("| %s | %s | %s | %s |\n",$1,$2,$3,$4) }' "reports/${{ github.run_id }}/last_commit_dates.csv"
+          } > "reports/${{ github.run_id }}/summary.md"
+
+          echo "Generated $(wc -l < reports/${{ github.run_id }}/last_commit_dates.csv)-1 rows."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: repo-health-${{ github.run_id }}
+          path: reports/${{ github.run_id }}/
+          if-no-files-found: error
