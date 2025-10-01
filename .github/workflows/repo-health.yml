@@ -1,4 +1,12 @@
-# .github/workflows/repo-health.yml
+# Conventional commit:
+# feat(repo-health): add auto-close & comment; fix jq owner path; harden inputs
+#
+# - Idempotent issue upsert with fingerprint + hash
+# - Auto-comment and close when repos become clean
+# - Fix jq path for __owner in auto-close step
+# - Safer defaults when triggered by cron (no inputs)
+# - Small robustness improvements
+
 name: Repo Health (Default vs Latest + Alerts w/ Auto-Close)
 
 on:
@@ -6,7 +14,7 @@ on:
     inputs:
       owners:
         description: "Comma-separated owners (users/orgs)"
-        required: true
+        required: false
         default: "shinedog,adriaanse-dev"
       include_archived:
         description: "Include archived repos (true/false)"
@@ -21,7 +29,7 @@ on:
         required: false
         default: "false"
       stale_days:
-        description: "Stale threshold in days (default 180)"
+        description: "Stale threshold in days"
         required: false
         default: "180"
       create_issues:
@@ -41,28 +49,54 @@ on:
 
 permissions:
   contents: read
-  issues: write   # needed for create/update/close comments
+  issues: write   # needed if you use GITHUB_TOKEN to open issues (PAT ignores this)
 
 jobs:
   repo-health:
     runs-on: ubuntu-latest
+
     env:
-      OWNERS_CSV: ${{ inputs.owners || 'shinedog,adriaanse-dev' }}
-      INC_ARCHIVED: ${{ inputs.include_archived || 'false' }}
-      INC_FORKS: ${{ inputs.include_forks || 'true' }}
-      ONLY_PRIVATE: ${{ inputs.only_private || 'false' }}
-      STALE_DAYS: ${{ inputs.stale_days || '180' }}
-      CREATE_ISSUES: ${{ inputs.create_issues || 'true' }}
-      FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical || 'true' }}
-      REOPEN_CLOSED: ${{ inputs.reopen_closed || 'true' }}
-      # PAT strongly recommended for private cross-owner scans (Fine-grained: read-only; or Classic: repo, read:org)
+      # Use raw inputs; fall back to defaults in the Prep step so cron runs are safe
+      OWNERS_CSV: ${{ inputs.owners }}
+      INC_ARCHIVED: ${{ inputs.include_archived }}
+      INC_FORKS: ${{ inputs.include_forks }}
+      ONLY_PRIVATE: ${{ inputs.only_private }}
+      STALE_DAYS: ${{ inputs.stale_days }}
+      CREATE_ISSUES: ${{ inputs.create_issues }}
+      FAIL_ON_CRITICAL: ${{ inputs.fail_on_critical }}
+      REOPEN_CLOSED: ${{ inputs.reopen_closed }}
+      # Prefer PAT for cross-repo private visibility; falls back to GITHUB_TOKEN
       GH_TOKEN_EFFECTIVE: ${{ secrets.GH_TOKEN_RO || github.token }}
+
     steps:
+      - name: Show tooling versions (gh, jq)
+        run: |
+          gh --version || true
+          jq --version
+
       - name: Prep
         run: |
           set -euo pipefail
           mkdir -p reports/${{ github.run_id }}
-          echo "$OWNERS_CSV" | tr ',' '\n' | awk '{$1=$1};1' > owners.txt
+          # Safe defaults when triggered by cron (inputs can be empty)
+          : "${OWNERS_CSV:=shinedog,adriaanse-dev}"
+          : "${INC_ARCHIVED:=false}"
+          : "${INC_FORKS:=true}"
+          : "${ONLY_PRIVATE:=false}"
+          : "${STALE_DAYS:=180}"
+          : "${CREATE_ISSUES:=true}"
+          : "${FAIL_ON_CRITICAL:=true}"
+          : "${REOPEN_CLOSED:=true}"
+          echo "OWNERS_CSV=$OWNERS_CSV" >> "$GITHUB_ENV"
+          echo "INC_ARCHIVED=$INC_ARCHIVED" >> "$GITHUB_ENV"
+          echo "INC_FORKS=$INC_FORKS" >> "$GITHUB_ENV"
+          echo "ONLY_PRIVATE=$ONLY_PRIVATE" >> "$GITHUB_ENV"
+          echo "STALE_DAYS=$STALE_DAYS" >> "$GITHUB_ENV"
+          echo "CREATE_ISSUES=$CREATE_ISSUES" >> "$GITHUB_ENV"
+          echo "FAIL_ON_CRITICAL=$FAIL_ON_CRITICAL" >> "$GITHUB_ENV"
+          echo "REOPEN_CLOSED=$REOPEN_CLOSED" >> "$GITHUB_ENV"
+
+          printf "%s\n" "$OWNERS_CSV" | tr ',' '\n' | awk '{$1=$1};1' > owners.txt
           date -u +"%Y-%m-%dT%H:%M:%SZ" > reports/${{ github.run_id }}/timestamp.txt
 
       - name: GraphQL sweep: repositories
@@ -186,7 +220,6 @@ jobs:
           set -euo pipefail
           OUT="reports/${{ github.run_id }}/repo_commits.csv"
           TS=$(cat reports/${{ github.run_id }}/timestamp.txt)
-          STALE_DAYS=${STALE_DAYS}
 
           # CSV -> JSON
           jq -R -s '
@@ -200,7 +233,7 @@ jobs:
           ' "$OUT" > table.json
 
           # evaluate rules
-          jq --arg now "$TS" --argjson days $STALE_DAYS '
+          jq --arg now "$TS" --argjson days ${STALE_DAYS} '
             def unq(x): x|gsub("^\"|\"$";"");
             def iso_to_secs($s): ( ($s|unq) | select(length>0) | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime );
             def stale($date):
@@ -226,7 +259,7 @@ jobs:
               ids: ($v | map("\(.owner)/\(.repo)")) }
           ' eval.json > violations.json
 
-          # Markdown summary (default-only + divergence + stale)
+          # Markdown summary
           {
             echo "### Default Branch Recency & Divergence"
             echo
@@ -237,7 +270,7 @@ jobs:
             ' eval.json
           } > "reports/${{ github.run_id }}/summary.md"
 
-          echo "violations=$(jq -r .count violations.json)" >> $GITHUB_OUTPUT
+          echo "violations=$(jq -r .count violations.json)" >> "$GITHUB_OUTPUT"
 
       - name: Create/Update issues on violating repos (idempotent w/ fingerprint & hash)
         if: ${{ env.CREATE_ISSUES == 'true' }}
@@ -267,7 +300,6 @@ Remediation checklist:
 EOF
           }
 
-          # stable hash of the logical payload
           sha_payload() {
             local owner="$1" repo="$2" def_branch="$3" last_def="$4" diverges="$5" stale="$6" stale_days="$7"
             printf '%s' "$owner|$repo|$def_branch|$last_def|$diverges|$stale|$stale_days" | sha256sum | awk '{print $1}'
@@ -299,12 +331,10 @@ EOF
               existing_body=$(jq -r '.[0].body // ""' <<<"$existing_json")
               prev_hash=$(grep -oE 'repo-health-hash: [a-f0-9]+' <<<"$existing_body" | awk '{print $3}' || true)
 
-              # reopen if closed and allowed
               if [ "$state" = "closed" ] && [ "$REOPEN_CLOSED" = "true" ]; then
                 gh api -X PATCH "/repos/$owner/$repo/issues/$num" -f state="open" >/dev/null
               fi
 
-              # update only if hash changed
               if [ "$prev_hash" != "$hash" ]; then
                 gh api -X PATCH "/repos/$owner/$repo/issues/$num" \
                   -f title="$title" -f body="$body" -f labels="repo-health" >/dev/null
@@ -324,21 +354,19 @@ EOF
           GH_TOKEN: ${{ env.GH_TOKEN_EFFECTIVE }}
         run: |
           set -euo pipefail
-          # Build a fast lookup of violating "owner/repo"
           jq -r '.ids[]?' violations.json > violating_ids.txt || true
 
-          # iterate all repos we scanned (filtered set)
-          jq -r '.[] | "\(. __owner)/\(.name)"' repos_filtered.json > all_ids.txt
+          # ✅ FIX: Correct jq path (no space) for __owner
+          jq -r '.[] | "\(..__owner)/\(.name)"' repos_filtered.json > all_ids.txt
 
           while read -r id; do
             [ -z "$id" ] && continue
             if grep -qx "$id" violating_ids.txt 2>/dev/null; then
-              continue  # still violating; do not close
+              continue
             fi
             owner="${id%%/*}"
             repo="${id##*/}"
 
-            # find open issues matching our fingerprint or exact title
             open_json=$(gh api "/repos/$owner/$repo/issues" -f per_page=100 -f state=open \
               -q '[.[] | select((.body != null and (.body | contains("repo-health-fp: '"$owner/$repo"'"))) or .title=="[Repo Health] Default branch stale/diverges")]')
 
